@@ -10,7 +10,7 @@ Supported chips:
     Addresses: ACPI NVDA8800 (\_SB_.MTEL)
     Datasheet: Reverse-engineered from ACPI DSDT _DSM method
 
-Author: SPBM Driver Contributors
+Author: Andrew Wang <RollingTheRock>
 
 Description
 -----------
@@ -123,3 +123,22 @@ Thermal Throttling Alarm:
 
 - ``temp1_crit_alarm``: Set to 1 when the PROCHOT thermal throttle signal is
   active, 0 during normal operation.
+
+Architecture & Planned Evolution
+--------------------------------
+
+The driver currently binds as an ``acpi_driver`` to ``NVDA8800`` because the
+OEM ACPI DSDT omits standard ``_UID`` and ``_STA`` methods, preventing the
+kernel ACPI bus from automatically instantiating a ``platform_device``.
+
+Planned Evolution (Andrew Wang / ##RollingTheRock):
+Future iterations will introduce a self-instantiating adapter utilizing
+``acpi_create_platform_device()``, refactoring the driver core into a pure,
+modern ``platform_driver`` conforming to the standard Linux Device Model (LDM).
+
+Acknowledgments
+---------------
+
+Special thanks to Antheas Kapenekakis for the initial reverse-engineering prototype
+implementation (spark_hwmon), which served as the foundational draft and inspired
+this industrial-grade driver refactoring.

@@ -28,7 +28,7 @@ Add the following entry to the kernel MAINTAINERS file:
 
 ```text
 SPBM HARDWARE MONITORING DRIVER
-M:	SPBM Driver Contributors
+M:	Andrew Wang <RollingTheRock>
 L:	linux-hwmon@vger.kernel.org
 S:	Maintained
 F:	Documentation/hwmon/spbm.rst

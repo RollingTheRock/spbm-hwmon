@@ -2,6 +2,9 @@
 /*
  * NVIDIA DGX Spark (GB10) SPBM Power Telemetry hwmon driver
  *
+ * Author: Andrew Wang <RollingTheRock>
+ * Based on initial reverse-engineering draft prototype by Antheas Kapenekakis.
+ *
  * Exposes the System Power Budget Manager (SPBM) shared memory as
  * standard Linux hwmon sensors. The MTEL (NVDA8800) ACPI device
  * provides a _DSM that describes its memory resources; this driver
@@ -14,9 +17,13 @@
  * cumulative energy counters in millijoules, and thermal zone
  * temperatures in centidegrees Celsius.
  *
- * This driver binds as an acpi_driver to the NVDA8800 device on the
- * ACPI bus. The device has no platform_device (missing _UID/_STA in
- * DSDT), so a platform_driver cannot be used.
+ * Architecture & Roadmap:
+ * Currently binds as an acpi_driver to the NVDA8800 device on the
+ * ACPI bus because DSDT lacks _UID/_STA.
+ * [RollingTheRock] ##RollingTheRock Planned Evolution:
+ * Next phase will abstract this into a self-instantiating platform_driver
+ * using acpi_create_platform_device(), decoupling hardware monitoring
+ * into modern Linux Device Model (LDM) platform_driver architecture.
  */
 
 #include <linux/module.h>
@@ -36,6 +43,7 @@
 #define SPBM_MAX_DSM_INDICES	16
 
 /*
+ * [RollingTheRock] ##RollingTheRock
  * DMI hardware whitelist to prevent false loading on non-GB10 ARM64 systems.
  */
 static const struct dmi_system_id spbm_dmi_table[] = {
@@ -258,6 +266,10 @@ static int spbm_read(struct device *dev, enum hwmon_sensor_types type,
 	    p->nrg_off[ch] != OFF_UNKNOWN) {
 		uint64_t uj;
 
+		/*
+		 * [RollingTheRock] ##RollingTheRock:
+		 * 64-bit monotonic energy accumulation to prevent 32-bit roll-over cliffs.
+		 */
 		mutex_lock(&p->lock);
 		raw = ioread32(p->base + p->nrg_off[ch]);
 		uj = spbm_energy_acc_update(&p->energy_acc[ch], raw);
@@ -312,6 +324,10 @@ static int spbm_write(struct device *dev, enum hwmon_sensor_types type,
 	    p->pwr_cap_off[ch] != OFF_UNKNOWN) {
 		u32 mw = (u32)(val / 1000);
 
+		/*
+		 * [RollingTheRock] ##RollingTheRock:
+		 * Mutex critical section protecting register write and firmware handshake.
+		 */
 		mutex_lock(&p->lock);
 		/* Enforce firmware floor <= cap <= ceiling; 0 = reset */
 		if (mw > 0 && p->pwr_max_off[ch] != OFF_UNKNOWN &&
@@ -421,6 +437,7 @@ static bool spbm_try_resolve(const char *key, u64 offset,
 {
 	int i;
 
+	/* [RollingTheRock] ##RollingTheRock: Enforce MMIO bounds defense */
 	if (spbm_validate_bounds(offset, sizeof(u32), res_size) != 0)
 		return false;
 
@@ -691,5 +708,5 @@ static struct acpi_driver spbm_driver = {
 module_acpi_driver(spbm_driver);
 
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("SPBM Driver Contributors");
+MODULE_AUTHOR("Andrew Wang <RollingTheRock>");
 MODULE_DESCRIPTION("NVIDIA DGX Spark (GB10) SPBM power hwmon driver");

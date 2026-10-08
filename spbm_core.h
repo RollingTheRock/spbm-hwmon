@@ -1,4 +1,8 @@
 /* SPDX-License-Identifier: GPL-2.0 */
+/*
+ * SPBM Hardware Monitoring Core Library
+ * Author: Andrew Wang <RollingTheRock> ##RollingTheRock
+ */
 #ifndef _SPBM_CORE_H
 #define _SPBM_CORE_H
 
@@ -8,7 +12,8 @@
 #include <linux/limits.h>
 
 /*
- * DMI matching helper
+ * [RollingTheRock] ##RollingTheRock:
+ * DMI matching helper for platform hardware whitelist.
  */
 struct spbm_dmi_info {
 	const char *sys_vendor;
@@ -43,7 +48,8 @@ static inline bool spbm_dmi_is_supported(const struct spbm_dmi_info *info)
 }
 
 /*
- * Memory boundary validation helper
+ * [RollingTheRock] ##RollingTheRock:
+ * Memory boundary validation helper protecting MMIO ranges.
  */
 static inline int spbm_validate_bounds(u64 offset, size_t size, u64 res_size)
 {
@@ -88,7 +94,8 @@ static inline bool spbm_try_resolve_bounds(const char *key, u64 offset,
 }
 
 /*
- * 64-bit Monotonic Energy Accumulator
+ * [RollingTheRock] ##RollingTheRock:
+ * 64-bit Monotonic Energy Accumulator resolving hardware 32-bit roll-over.
  */
 struct spbm_energy_acc {
 	u64 accumulated_uj;

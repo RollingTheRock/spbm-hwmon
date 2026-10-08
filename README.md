@@ -133,6 +133,31 @@ make unload
 
 ---
 
+## Roadmap: Self-Instantiating platform_driver Abstraction
+
+Currently, the driver binds as an `acpi_driver` to `NVDA8800` because the OEM ACPI DSDT omits standard `_UID` and `_STA` objects, causing the Linux ACPI core to bypass automatic `platform_device` instantiation.
+
+**Planned Evolution (Andrew Wang / ##RollingTheRock):**
+In the next milestone, we will introduce a lightweight self-instantiating ACPI-to-platform adapter using the kernel-exported `acpi_create_platform_device()` symbol. This will:
+1. Automatically bind to the `NVDA8800` ACPI handle upon module initialization.
+2. Instantiate a first-class `struct platform_device` on `platform_bus_type`.
+3. Fully refactor the driver core into a clean, modern `platform_driver` (`platform_driver_register`, `platform_get_resource`, `devm_ioremap_resource`), aligning 100% with the standard Linux Device Model (LDM) while preserving standalone out-of-tree agility.
+
+---
+
+## Author & Maintainer
+
+- **Author**: Andrew Wang ([@RollingTheRock](https://github.com/RollingTheRock)) `##RollingTheRock`
+
+---
+
+## Acknowledgments
+
+Special thanks to **Antheas Kapenekakis** for the initial reverse-engineering prototype implementation (`spark_hwmon`), which served as the foundational draft and inspired this industrial-grade driver refactoring.
+
+---
+
 ## License
 
-GPL-2.0
+This project is licensed under the **GNU General Public License v2.0 (GPL-2.0)**, consistent with the Linux kernel itself. See [LICENSE](LICENSE) for details.
+
