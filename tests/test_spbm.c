@@ -10,6 +10,42 @@
 #include <errno.h>
 
 #include "../spbm_core.h"
+#include <pthread.h>
+
+/*
+ * Mock device for testing concurrency
+ */
+struct spbm_mock_device {
+	pthread_mutex_t lock;
+	bool in_critical_section;
+	uint32_t last_val;
+	uint32_t poke_count;
+};
+
+static inline void spbm_mock_device_init(struct spbm_mock_device *dev)
+{
+	pthread_mutex_init(&dev->lock, NULL);
+	dev->in_critical_section = false;
+	dev->last_val = 0;
+	dev->poke_count = 0;
+}
+
+static inline int spbm_mock_write_power_cap(struct spbm_mock_device *dev,
+					    int ch, long val)
+{
+	(void)ch;
+	pthread_mutex_lock(&dev->lock);
+	dev->in_critical_section = true;
+
+	uint32_t mw = (uint32_t)(val / 1000);
+
+	dev->last_val = mw;
+	dev->poke_count++;
+
+	dev->in_critical_section = false;
+	pthread_mutex_unlock(&dev->lock);
+	return 0;
+}
 
 static int tests_run = 0;
 static int tests_failed = 0;

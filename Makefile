@@ -46,7 +46,7 @@ clean:
 	rm -f tests/test_runner
 
 test:
-	$(CC) -Wall -Wextra tests/test_spbm.c -o tests/test_runner
+	$(CC) -Wall -Wextra -Itests/include tests/test_spbm.c -o tests/test_runner
 	./tests/test_runner
 
 .PHONY: all modules sign load unload clean test

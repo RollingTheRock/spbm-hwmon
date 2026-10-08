@@ -2,19 +2,10 @@
 #ifndef _SPBM_CORE_H
 #define _SPBM_CORE_H
 
-#ifdef __KERNEL__
 #include <linux/types.h>
 #include <linux/errno.h>
 #include <linux/string.h>
 #include <linux/limits.h>
-#define SPBM_U64_MAX U64_MAX
-#else
-#include <stdint.h>
-#include <stdbool.h>
-#include <errno.h>
-#include <string.h>
-#define SPBM_U64_MAX UINT64_MAX
-#endif
 
 /*
  * DMI matching helper
@@ -54,13 +45,13 @@ static inline bool spbm_dmi_is_supported(const struct spbm_dmi_info *info)
 /*
  * Memory boundary validation helper
  */
-static inline int spbm_validate_bounds(uint64_t offset, size_t size, uint64_t res_size)
+static inline int spbm_validate_bounds(u64 offset, size_t size, u64 res_size)
 {
 	if (res_size == 0 || size == 0)
 		return -EINVAL;
 
 	/* Check for unsigned wrap-around */
-	if (offset > SPBM_U64_MAX - size)
+	if (offset > U64_MAX - size)
 		return -EOVERFLOW;
 
 	if (offset + size > res_size)
@@ -77,19 +68,19 @@ struct spbm_chan_def {
 	const char *label;
 };
 
-static inline bool spbm_try_resolve_bounds(const char *key, uint64_t offset,
-					   uint64_t res_size,
+static inline bool spbm_try_resolve_bounds(const char *key, u64 offset,
+					   u64 res_size,
 					   const struct spbm_chan_def *chans,
-					   uint32_t *offsets, int n)
+					   u32 *offsets, int n)
 {
 	int i;
 
-	if (spbm_validate_bounds(offset, sizeof(uint32_t), res_size) != 0)
+	if (spbm_validate_bounds(offset, sizeof(u32), res_size) != 0)
 		return false;
 
 	for (i = 0; i < n; i++) {
 		if (strcmp(chans[i].dsm_key, key) == 0) {
-			offsets[i] = (uint32_t)offset;
+			offsets[i] = (u32)offset;
 			return true;
 		}
 	}
@@ -100,19 +91,19 @@ static inline bool spbm_try_resolve_bounds(const char *key, uint64_t offset,
  * 64-bit Monotonic Energy Accumulator
  */
 struct spbm_energy_acc {
-	uint64_t accumulated_uj;
-	uint32_t last_raw_mj;
+	u64 accumulated_uj;
+	u32 last_raw_mj;
 	bool initialized;
 };
 
-static inline void spbm_energy_acc_init(struct spbm_energy_acc *acc, uint32_t initial_raw_mj)
+static inline void spbm_energy_acc_init(struct spbm_energy_acc *acc, u32 initial_raw_mj)
 {
-	acc->accumulated_uj = (uint64_t)initial_raw_mj * 1000ULL;
+	acc->accumulated_uj = (u64)initial_raw_mj * 1000ULL;
 	acc->last_raw_mj = initial_raw_mj;
 	acc->initialized = true;
 }
 
-static inline uint64_t spbm_energy_acc_update(struct spbm_energy_acc *acc, uint32_t raw_mj)
+static inline u64 spbm_energy_acc_update(struct spbm_energy_acc *acc, u32 raw_mj)
 {
 	if (!acc->initialized) {
 		spbm_energy_acc_init(acc, raw_mj);
@@ -120,9 +111,9 @@ static inline uint64_t spbm_energy_acc_update(struct spbm_energy_acc *acc, uint3
 	}
 
 	/* Unsigned 32-bit subtraction correctly handles roll-over */
-	uint32_t delta_mj = raw_mj - acc->last_raw_mj;
+	u32 delta_mj = raw_mj - acc->last_raw_mj;
 
-	acc->accumulated_uj += (uint64_t)delta_mj * 1000ULL;
+	acc->accumulated_uj += (u64)delta_mj * 1000ULL;
 	acc->last_raw_mj = raw_mj;
 
 	return acc->accumulated_uj;
@@ -166,44 +157,5 @@ static inline bool spbm_hwmon_attr_is_standard(const char *name)
 
 	return false;
 }
-
-/*
- * Concurrency & Mailbox write abstraction
- */
-#ifndef __KERNEL__
-#include <pthread.h>
-
-struct spbm_mock_device {
-	pthread_mutex_t lock;
-	bool in_critical_section;
-	uint32_t last_val;
-	uint32_t poke_count;
-};
-
-static inline void spbm_mock_device_init(struct spbm_mock_device *dev)
-{
-	pthread_mutex_init(&dev->lock, NULL);
-	dev->in_critical_section = false;
-	dev->last_val = 0;
-	dev->poke_count = 0;
-}
-
-static inline int spbm_mock_write_power_cap(struct spbm_mock_device *dev,
-					    int ch, long val)
-{
-	(void)ch;
-	pthread_mutex_lock(&dev->lock);
-	dev->in_critical_section = true;
-
-	uint32_t mw = (uint32_t)(val / 1000);
-
-	dev->last_val = mw;
-	dev->poke_count++;
-
-	dev->in_critical_section = false;
-	pthread_mutex_unlock(&dev->lock);
-	return 0;
-}
-#endif
 
 #endif /* _SPBM_CORE_H */
