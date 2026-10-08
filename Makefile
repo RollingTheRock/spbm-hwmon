@@ -43,5 +43,10 @@ unload:
 
 clean:
 	$(MAKE) -C $(KDIR) M=$(CURDIR) clean
+	rm -f tests/test_runner
 
-.PHONY: all modules sign load unload clean
+test:
+	$(CC) -Wall -Wextra tests/test_spbm.c -o tests/test_runner
+	./tests/test_runner
+
+.PHONY: all modules sign load unload clean test

@@ -17,14 +17,6 @@
  * This driver binds as an acpi_driver to the NVDA8800 device on the
  * ACPI bus. The device has no platform_device (missing _UID/_STA in
  * DSDT), so a platform_driver cannot be used.
- *
- * Usage:
- *   sudo modprobe spbm   (or auto-loaded via DKMS + udev)
- *   sensors spbm-*
- *   cat /sys/class/hwmon/hwmonN/power1_input   # microwatts
- *
- * Discovered by reverse-engineering the DSDT _DSM for NVDA8800.
- * No upstream driver exists as of kernel 7.0.
  */
 
 #include <linux/module.h>
@@ -32,14 +24,51 @@
 #include <linux/hwmon-sysfs.h>
 #include <linux/io.h>
 #include <linux/acpi.h>
+#include <linux/dmi.h>
+#include <linux/mutex.h>
 #include <linux/list.h>
 #include <linux/uuid.h>
 
-#define DRIVER_NAME	"spbm"
-#define SPBM_SIZE	0x1000
+#include "spbm_core.h"
 
-/* Sentinel: offset not discovered via _DSM */
-#define OFF_UNKNOWN	U32_MAX
+#define DRIVER_NAME		"spbm"
+#define OFF_UNKNOWN		U32_MAX
+#define SPBM_MAX_DSM_INDICES	16
+
+/*
+ * DMI hardware whitelist to prevent false loading on non-GB10 ARM64 systems.
+ */
+static const struct dmi_system_id spbm_dmi_table[] = {
+	{
+		.ident = "NVIDIA DGX Spark",
+		.matches = {
+			DMI_MATCH(DMI_SYS_VENDOR, "NVIDIA"),
+			DMI_MATCH(DMI_PRODUCT_FAMILY, "DGX Spark"),
+		},
+	},
+	{
+		.ident = "NVIDIA DGX Spark (Product Name)",
+		.matches = {
+			DMI_MATCH(DMI_SYS_VENDOR, "NVIDIA"),
+			DMI_MATCH(DMI_PRODUCT_NAME, "DGX Spark"),
+		},
+	},
+	{
+		.ident = "XFUSION FusionXpark GB10",
+		.matches = {
+			DMI_MATCH(DMI_SYS_VENDOR, "XFUSION"),
+			DMI_MATCH(DMI_PRODUCT_NAME, "FusionXpark GB10"),
+		},
+	},
+	{
+		.ident = "GB10 Generic Match",
+		.matches = {
+			DMI_MATCH(DMI_PRODUCT_FAMILY, "DGX Spark"),
+		},
+	},
+	{ }
+};
+MODULE_DEVICE_TABLE(dmi, spbm_dmi_table);
 
 /*
  * _DSM UUID for NVDA8800 MTEL device.
@@ -49,10 +78,7 @@ static const guid_t mtel_dsm_guid =
 	GUID_INIT(0x12345678, 0x1234, 0x1234,
 		  0x12, 0x34, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc);
 
-/*
- * Channel definition: _DSM register name -> hwmon label.
- * Offsets are discovered at probe time via _DSM function 2.
- */
+/* Channel definition: _DSM register name -> hwmon label */
 struct spbm_chan {
 	const char *dsm_key;	/* _DSM register name to match */
 	const char *label;	/* hwmon label */
@@ -63,16 +89,16 @@ static const struct spbm_chan pwr_chans[] = {
 	{ "SPBM_TE_SYS_TOTAL_TELEMETRY_OFFSET",		"sys_total" },
 	{ "SPBM_TE_SOC_PKG_TELEMETRY_OFFSET",		"soc_pkg" },
 	{ "SPBM_TE_C_AND_G_TELEMETRY_OFFSET",		"cpu_gpu" },
-	{ "SPBM_TE_CPU_P_TELEMETRY_OFFSET",			"cpu_p" },
-	{ "SPBM_TE_CPU_E_TELEMETRY_OFFSET",			"cpu_e" },
-	{ "SPBM_TE_VCORE_TELEMETRY_OFFSET",			"vcore" },
-	{ "SPBM_TE_CHR_TELEMETRY_OFFSET",			"dc_input" },
-	{ "SPBM_TE_TOTAL_GPU_OUT_OFFSET",			"gpu" },
-	{ "SPBM_TE_PREREG_IN_OFFSET",				"prereg" },
-	{ "SPBM_TE_DLA_IN_OFFSET",					"dla" },
+	{ "SPBM_TE_CPU_P_TELEMETRY_OFFSET",		"cpu_p" },
+	{ "SPBM_TE_CPU_E_TELEMETRY_OFFSET",		"cpu_e" },
+	{ "SPBM_TE_VCORE_TELEMETRY_OFFSET",		"vcore" },
+	{ "SPBM_TE_CHR_TELEMETRY_OFFSET",		"dc_input" },
+	{ "SPBM_TE_TOTAL_GPU_OUT_OFFSET",		"gpu" },
+	{ "SPBM_TE_PREREG_IN_OFFSET",			"prereg" },
+	{ "SPBM_TE_DLA_IN_OFFSET",			"dla" },
 	/* PL channels: input = EWMA-smoothed power, cap/max = limits */
-	{ "SPBM_PWR_AVG_EWMA_S_PL1_OFFSET",			"pl1" },
-	{ "SPBM_PWR_AVG_EWMA_S_PL2_OFFSET",			"pl2" },
+	{ "SPBM_PWR_AVG_EWMA_S_PL1_OFFSET",		"pl1" },
+	{ "SPBM_PWR_AVG_EWMA_S_PL2_OFFSET",		"pl2" },
 	{ "SPBM_PWR_AVG_EWMA_S_SYSPL1_OFFSET",		"syspl1" },
 	{ "SPBM_PWR_AVG_EWMA_S_SYSPL2_OFFSET",		"syspl2" },
 };
@@ -89,110 +115,106 @@ static const struct spbm_chan nrg_chans[] = {
 
 /* Temperature channels (centidegrees C in firmware, millidegrees C in hwmon) */
 static const struct spbm_chan temp_chans[] = {
-	{ "SPBM_PKG_TJ_MAX_OFFSET",							"tj_max" },
-	{ "SPBM_PKG_THERMAL_ZONE_TEMP_CPU_E_CLU_0_OFFSET",	"cpu_e_clu0" },
-	{ "SPBM_PKG_THERMAL_ZONE_TEMP_CPU_P_CLU_0_OFFSET",	"cpu_p_clu0" },
-	{ "SPBM_PKG_THERMAL_ZONE_TEMP_CPU_E_CLU_1_OFFSET",	"cpu_e_clu1" },
-	{ "SPBM_PKG_THERMAL_ZONE_TEMP_CPU_P_CLU_1_OFFSET",	"cpu_p_clu1" },
-	{ "SPBM_PKG_THERMAL_ZONE_TEMP_GPU_OFFSET",			"gpu" },
-	{ "SPBM_PKG_THERMAL_ZONE_TEMP_SOC_OFFSET",			"soc" },
-	{ "SPBM_PKG_THERMAL_ZONE_TEMP_DLA_OFFSET",			"dla" },
+	{ "SPBM_PKG_TJ_MAX_OFFSET",			"tj_max" },
+	{ "SPBM_PKG_THERMAL_ZONE_TEMP_CPU_E_CLU_0_OFFSET", "cpu_e_clu0" },
+	{ "SPBM_PKG_THERMAL_ZONE_TEMP_CPU_P_CLU_0_OFFSET", "cpu_p_clu0" },
+	{ "SPBM_PKG_THERMAL_ZONE_TEMP_CPU_E_CLU_1_OFFSET", "cpu_e_clu1" },
+	{ "SPBM_PKG_THERMAL_ZONE_TEMP_CPU_P_CLU_1_OFFSET", "cpu_p_clu1" },
+	{ "SPBM_PKG_THERMAL_ZONE_TEMP_GPU_OFFSET",	"gpu" },
+	{ "SPBM_PKG_THERMAL_ZONE_TEMP_SOC_OFFSET",	"soc" },
+	{ "SPBM_PKG_THERMAL_ZONE_TEMP_DLA_OFFSET",	"dla" },
 };
 #define N_TEMP ARRAY_SIZE(temp_chans)
-
-/* Status registers (dimensionless) exposed as plain sysfs attributes */
-static const struct spbm_chan status_chans[] = {
-	{ "SPBM_PROCHOT_STATUS_OFFSET",			"prochot" },
-	{ "SPBM_PL_CUR_LEVEL_STATUS_OFFSET",	"pl_level" },
-	{ "SPBM_PKG_TJ_MAX_C_OFFSET",			"tj_max_c" },
-};
-#define N_STATUS ARRAY_SIZE(status_chans)
 
 /* OS-writable power limit registers (mW) */
 static const struct spbm_chan pl_os_chans[] = {
 	{ "SPBM_PL1_VAL_OS_OFFSET",			"pl1_os" },
 	{ "SPBM_PL2_VAL_OS_OFFSET",			"pl2_os" },
-	{ "SPBM_SYSPL1_VAL_OS_OFFSET",		"syspl1_os" },
-	{ "SPBM_SYSPL2_VAL_OS_OFFSET",		"syspl2_os" },
+	{ "SPBM_SYSPL1_VAL_OS_OFFSET",			"syspl1_os" },
+	{ "SPBM_SYSPL2_VAL_OS_OFFSET",			"syspl2_os" },
 };
 #define N_PL_OS ARRAY_SIZE(pl_os_chans)
 
 /* Firmware power limit ceiling (read-only, for power_max) */
 static const struct spbm_chan pwr_high_chans[] = {
-	{ "SPBM_PL1_LIMIT_HIGH_OFFSET",		"pl1" },
-	{ "SPBM_PL2_LIMIT_HIGH_OFFSET",		"pl2" },
-	{ "SPBM_SYSPL1_LIMIT_HIGH_OFFSET",	"syspl1" },
-	{ "SPBM_SYSPL2_LIMIT_HIGH_OFFSET",	"syspl2" },
+	{ "SPBM_PL1_LIMIT_HIGH_OFFSET",			"pl1" },
+	{ "SPBM_PL2_LIMIT_HIGH_OFFSET",			"pl2" },
+	{ "SPBM_SYSPL1_LIMIT_HIGH_OFFSET",		"syspl1" },
+	{ "SPBM_SYSPL2_LIMIT_HIGH_OFFSET",		"syspl2" },
 };
 #define N_PWR_HIGH ARRAY_SIZE(pwr_high_chans)
 
 /* Firmware power limit floor (read-only, for power_min) */
 static const struct spbm_chan pwr_low_chans[] = {
-	{ "SPBM_PL1_LIMIT_LOW_OFFSET",		"pl1" },
-	{ "SPBM_PL2_LIMIT_LOW_OFFSET",		"pl2" },
-	{ "SPBM_SYSPL1_LIMIT_LOW_OFFSET",	"syspl1" },
-	{ "SPBM_SYSPL2_LIMIT_LOW_OFFSET",	"syspl2" },
+	{ "SPBM_PL1_LIMIT_LOW_OFFSET",			"pl1" },
+	{ "SPBM_PL2_LIMIT_LOW_OFFSET",			"pl2" },
+	{ "SPBM_SYSPL1_LIMIT_LOW_OFFSET",		"syspl1" },
+	{ "SPBM_SYSPL2_LIMIT_LOW_OFFSET",		"syspl2" },
 };
 #define N_PWR_LOW ARRAY_SIZE(pwr_low_chans)
 
 /* Effective power limit registers (for power_cap readback when OS=0) */
 static const struct spbm_chan pwr_eff_chans[] = {
-	{ "SPBM_PL1_VAL_OFFSET",	"pl1" },
-	{ "SPBM_PL2_VAL_OFFSET",	"pl2" },
-	{ "SPBM_SYSPL1_VAL_OFFSET",	"syspl1" },
-	{ "SPBM_SYSPL2_VAL_OFFSET",	"syspl2" },
+	{ "SPBM_PL1_VAL_OFFSET",			"pl1" },
+	{ "SPBM_PL2_VAL_OFFSET",			"pl2" },
+	{ "SPBM_SYSPL1_VAL_OFFSET",			"syspl1" },
+	{ "SPBM_SYSPL2_VAL_OFFSET",			"syspl2" },
 };
 #define N_PWR_EFF ARRAY_SIZE(pwr_eff_chans)
 
 struct spbm_priv {
 	void __iomem *base;
+	resource_size_t res_size;
+	struct mutex lock;
 	u32 pwr_off[N_PWR];
-	u32 pwr_cap_off[N_PWR];	/* OS limit for power_cap, or OFF_UNKNOWN */
-	u32 pwr_max_off[N_PWR];	/* firmware limit ceiling for power_max */
-	u32 pwr_min_off[N_PWR];	/* firmware limit floor for power_min */
-	u32 pwr_eff_off[N_PWR];	/* effective limit for cap readback */
+	u32 pwr_cap_off[N_PWR];
+	u32 pwr_max_off[N_PWR];
+	u32 pwr_min_off[N_PWR];
+	u32 pwr_eff_off[N_PWR];
 	u32 nrg_off[N_NRG];
+	struct spbm_energy_acc energy_acc[N_NRG];
 	u32 temp_off[N_TEMP];
-	u32 status_off[N_STATUS];
+	u32 prochot_off;
 	u32 pl_os_off[N_PL_OS];
-	u32 pwr_high_off[N_PWR_HIGH];	/* resolved high offsets (temp) */
-	u32 pwr_low_off[N_PWR_LOW];	/* resolved low offsets (temp) */
-	u32 pwr_eff_resolve[N_PWR_EFF];	/* resolved effective offsets (temp) */
-	/* Dynamic status sysfs */
-	struct sensor_device_attribute status_sattrs[N_STATUS];
-	struct attribute *status_attrs[N_STATUS + 1];
-	struct attribute_group status_group;
-	const struct attribute_group *extra_groups[2];
+	u32 pwr_high_off[N_PWR_HIGH];
+	u32 pwr_low_off[N_PWR_LOW];
+	u32 pwr_eff_resolve[N_PWR_EFF];
 };
 
 /* hwmon callbacks */
 
 static umode_t spbm_visible(const void *data, enum hwmon_sensor_types type,
-			     u32 attr, int ch)
+			    u32 attr, int ch)
 {
 	const struct spbm_priv *p = data;
 
-	if (type == hwmon_power && ch < N_PWR &&
-	    p->pwr_off[ch] != OFF_UNKNOWN &&
-	    (attr == hwmon_power_input || attr == hwmon_power_label))
-		return 0444;
-	if (type == hwmon_power && attr == hwmon_power_cap && ch < N_PWR &&
-	    p->pwr_cap_off[ch] != OFF_UNKNOWN)
-		return 0644;
-	if (type == hwmon_power && attr == hwmon_power_max && ch < N_PWR &&
-	    p->pwr_max_off[ch] != OFF_UNKNOWN)
-		return 0444;
-	if (type == hwmon_power && attr == hwmon_power_min && ch < N_PWR &&
-	    p->pwr_min_off[ch] != OFF_UNKNOWN)
-		return 0444;
+	if (type == hwmon_power && ch < N_PWR) {
+		if (p->pwr_off[ch] != OFF_UNKNOWN &&
+		    (attr == hwmon_power_input || attr == hwmon_power_label))
+			return 0444;
+		if (attr == hwmon_power_cap && p->pwr_cap_off[ch] != OFF_UNKNOWN)
+			return 0644;
+		if (attr == hwmon_power_max && p->pwr_max_off[ch] != OFF_UNKNOWN)
+			return 0444;
+		if (attr == hwmon_power_min && p->pwr_min_off[ch] != OFF_UNKNOWN)
+			return 0444;
+	}
+
 	if (type == hwmon_energy && ch < N_NRG &&
 	    p->nrg_off[ch] != OFF_UNKNOWN &&
 	    (attr == hwmon_energy_input || attr == hwmon_energy_label))
 		return 0444;
-	if (type == hwmon_temp && ch < N_TEMP &&
-	    p->temp_off[ch] != OFF_UNKNOWN &&
-	    (attr == hwmon_temp_input || attr == hwmon_temp_label))
-		return 0444;
+
+	if (type == hwmon_temp && ch < N_TEMP) {
+		if (p->temp_off[ch] != OFF_UNKNOWN &&
+		    (attr == hwmon_temp_input || attr == hwmon_temp_label))
+			return 0444;
+		/* Standard hwmon crit alarm mapping for PROCHOT on channel 0 (tj_max) */
+		if (ch == 0 && attr == hwmon_temp_crit_alarm &&
+		    p->prochot_off != OFF_UNKNOWN)
+			return 0444;
+	}
+
 	return 0;
 }
 
@@ -211,7 +233,6 @@ static int spbm_read(struct device *dev, enum hwmon_sensor_types type,
 		}
 		if (attr == hwmon_power_cap &&
 		    p->pwr_cap_off[ch] != OFF_UNKNOWN) {
-			/* Always prefer effective limit; fall back to OS reg */
 			if (p->pwr_eff_off[ch] != OFF_UNKNOWN)
 				raw = ioread32(p->base + p->pwr_eff_off[ch]);
 			else
@@ -232,24 +253,40 @@ static int spbm_read(struct device *dev, enum hwmon_sensor_types type,
 			return 0;
 		}
 	}
+
 	if (type == hwmon_energy && attr == hwmon_energy_input && ch < N_NRG &&
 	    p->nrg_off[ch] != OFF_UNKNOWN) {
+		uint64_t uj;
+
+		mutex_lock(&p->lock);
 		raw = ioread32(p->base + p->nrg_off[ch]);
-		*val = (long)raw * 1000; /* mJ -> uJ */
+		uj = spbm_energy_acc_update(&p->energy_acc[ch], raw);
+		*val = (long)uj;
+		mutex_unlock(&p->lock);
 		return 0;
 	}
-	if (type == hwmon_temp && attr == hwmon_temp_input && ch < N_TEMP &&
-	    p->temp_off[ch] != OFF_UNKNOWN) {
-		raw = ioread32(p->base + p->temp_off[ch]);
-		*val = (long)raw * 10; /* centidegrees -> millidegrees C */
-		return 0;
+
+	if (type == hwmon_temp && ch < N_TEMP) {
+		if (attr == hwmon_temp_input &&
+		    p->temp_off[ch] != OFF_UNKNOWN) {
+			raw = ioread32(p->base + p->temp_off[ch]);
+			*val = (long)raw * 10; /* centidegrees -> millidegrees C */
+			return 0;
+		}
+		if (ch == 0 && attr == hwmon_temp_crit_alarm &&
+		    p->prochot_off != OFF_UNKNOWN) {
+			*val = !!ioread32(p->base + p->prochot_off);
+			return 0;
+		}
 	}
+
 	return -EOPNOTSUPP;
 }
 
 static int spbm_read_string(struct device *dev, enum hwmon_sensor_types type,
 			    u32 attr, int ch, const char **str)
 {
+	(void)attr;
 	if (type == hwmon_power && ch < N_PWR) {
 		*str = pwr_chans[ch].label;
 		return 0;
@@ -269,21 +306,30 @@ static int spbm_write(struct device *dev, enum hwmon_sensor_types type,
 		      u32 attr, int ch, long val)
 {
 	struct spbm_priv *p = dev_get_drvdata(dev);
+	int ret = 0;
 
 	if (type == hwmon_power && attr == hwmon_power_cap && ch < N_PWR &&
 	    p->pwr_cap_off[ch] != OFF_UNKNOWN) {
 		u32 mw = (u32)(val / 1000);
 
+		mutex_lock(&p->lock);
 		/* Enforce firmware floor <= cap <= ceiling; 0 = reset */
 		if (mw > 0 && p->pwr_max_off[ch] != OFF_UNKNOWN &&
-		    mw > ioread32(p->base + p->pwr_max_off[ch]))
-			return -EINVAL;
+		    mw > ioread32(p->base + p->pwr_max_off[ch])) {
+			ret = -EINVAL;
+			goto unlock;
+		}
 		if (mw > 0 && p->pwr_min_off[ch] != OFF_UNKNOWN &&
-		    mw < ioread32(p->base + p->pwr_min_off[ch]))
-			return -EINVAL;
+		    mw < ioread32(p->base + p->pwr_min_off[ch])) {
+			ret = -EINVAL;
+			goto unlock;
+		}
 		iowrite32(mw, p->base + p->pwr_cap_off[ch]);
 		iowrite32(1, p->base);	/* poke UPDATE_SPBM */
-		return 0;
+
+unlock:
+		mutex_unlock(&p->lock);
+		return ret;
 	}
 	return -EOPNOTSUPP;
 }
@@ -295,7 +341,7 @@ static const struct hwmon_ops spbm_ops = {
 	.read_string = spbm_read_string,
 };
 
-/* Build config arrays with a trailing 0 sentinel */
+/* Build config arrays with trailing sentinels */
 
 static const u32 pwr_cfg[N_PWR + 1] = {
 	[0 ... N_PWR - 1] = HWMON_P_INPUT | HWMON_P_LABEL | HWMON_P_CAP |
@@ -309,7 +355,8 @@ static const u32 nrg_cfg[N_NRG + 1] = {
 };
 
 static const u32 temp_cfg[N_TEMP + 1] = {
-	[0 ... N_TEMP - 1] = HWMON_T_INPUT | HWMON_T_LABEL,
+	[0] = HWMON_T_INPUT | HWMON_T_LABEL | HWMON_T_CRIT_ALARM,
+	[1 ... N_TEMP - 1] = HWMON_T_INPUT | HWMON_T_LABEL,
 	[N_TEMP] = 0,
 };
 
@@ -337,36 +384,8 @@ static const struct hwmon_chip_info spbm_chip = {
 	.info = spbm_info,
 };
 
-/* Custom sysfs attributes for dimensionless status registers */
-
-static ssize_t spbm_status_show(struct device *dev,
-				struct device_attribute *attr, char *buf)
-{
-	struct spbm_priv *p = dev_get_drvdata(dev);
-	int idx = to_sensor_dev_attr(attr)->index;
-
-	if (idx >= N_STATUS || p->status_off[idx] == OFF_UNKNOWN)
-		return -ENODATA;
-	return sysfs_emit(buf, "%u\n", ioread32(p->base + p->status_off[idx]));
-}
-
-static umode_t spbm_status_visible(struct kobject *kobj, struct attribute *a,
-				    int idx)
-{
-	struct device *dev = kobj_to_dev(kobj);
-	struct spbm_priv *p = dev_get_drvdata(dev);
-
-	if (idx < N_STATUS && p->status_off[idx] != OFF_UNKNOWN)
-		return 0444;
-	return 0;
-}
-
 /* ACPI _DSM helpers */
 
-/*
- * Query _DSM function 1 to get the resource name list, then return
- * the index of the entry matching @name.  Returns -ENOENT if not found.
- */
 static int spbm_dsm_find_resource(acpi_handle handle, const char *name)
 {
 	union acpi_object *out, *elem;
@@ -395,15 +414,15 @@ free:
 	return ret;
 }
 
-/*
- * Look up a DSM key in a channel table and store the offset.
- * Returns true if the key matched a channel.
- */
 static bool spbm_try_resolve(const char *key, u64 offset,
+			     resource_size_t res_size,
 			     const struct spbm_chan *chans, u32 *offsets,
 			     int n)
 {
 	int i;
+
+	if (spbm_validate_bounds(offset, sizeof(u32), res_size) != 0)
+		return false;
 
 	for (i = 0; i < n; i++) {
 		if (!strcmp(chans[i].dsm_key, key)) {
@@ -414,11 +433,6 @@ static bool spbm_try_resolve(const char *key, u64 offset,
 	return false;
 }
 
-/*
- * Call _DSM function 2 with sub-index @sub_idx.  Walk the returned
- * nested packages of {count, "name", offset, ...} pairs and resolve
- * offsets for all channel tables.
- */
 static int spbm_dsm_resolve_offsets(struct device *dev, acpi_handle handle,
 				    int sub_idx, struct spbm_priv *p)
 {
@@ -426,6 +440,7 @@ static int spbm_dsm_resolve_offsets(struct device *dev, acpi_handle handle,
 	union acpi_object *out, *sub, *elem;
 	int i, j, count, resolved = 0;
 
+	(void)dev;
 	arg_elem.type = ACPI_TYPE_INTEGER;
 	arg_elem.integer.value = sub_idx;
 	arg_pkg.type = ACPI_TYPE_PACKAGE;
@@ -441,7 +456,6 @@ static int spbm_dsm_resolve_offsets(struct device *dev, acpi_handle handle,
 		return -EINVAL;
 	}
 
-	/* Walk each sub-package: {count, name1, off1, name2, off2, ...} */
 	for (i = 0; i < out->package.count; i++) {
 		sub = &out->package.elements[i];
 		if (sub->type != ACPI_TYPE_PACKAGE || sub->package.count < 3)
@@ -453,8 +467,8 @@ static int spbm_dsm_resolve_offsets(struct device *dev, acpi_handle handle,
 		count = elem[0].integer.value;
 
 		for (j = 0; j < count; j++) {
-			int ni = 1 + j * 2;	/* name index */
-			int oi = 2 + j * 2;	/* offset index */
+			int ni = 1 + j * 2;
+			int oi = 2 + j * 2;
 
 			if (oi >= sub->package.count)
 				break;
@@ -464,34 +478,43 @@ static int spbm_dsm_resolve_offsets(struct device *dev, acpi_handle handle,
 
 			if (spbm_try_resolve(elem[ni].string.pointer,
 					     elem[oi].integer.value,
+					     p->res_size,
 					     pwr_chans, p->pwr_off, N_PWR) ||
 			    spbm_try_resolve(elem[ni].string.pointer,
 					     elem[oi].integer.value,
+					     p->res_size,
 					     nrg_chans, p->nrg_off, N_NRG) ||
 			    spbm_try_resolve(elem[ni].string.pointer,
 					     elem[oi].integer.value,
+					     p->res_size,
 					     temp_chans, p->temp_off, N_TEMP) ||
 			    spbm_try_resolve(elem[ni].string.pointer,
 					     elem[oi].integer.value,
-					     status_chans, p->status_off,
-					     N_STATUS) ||
-			    spbm_try_resolve(elem[ni].string.pointer,
-					     elem[oi].integer.value,
+					     p->res_size,
 					     pl_os_chans, p->pl_os_off,
 					     N_PL_OS) ||
 			    spbm_try_resolve(elem[ni].string.pointer,
 					     elem[oi].integer.value,
+					     p->res_size,
 					     pwr_high_chans, p->pwr_high_off,
 					     N_PWR_HIGH) ||
 			    spbm_try_resolve(elem[ni].string.pointer,
 					     elem[oi].integer.value,
+					     p->res_size,
 					     pwr_low_chans, p->pwr_low_off,
 					     N_PWR_LOW) ||
 			    spbm_try_resolve(elem[ni].string.pointer,
 					     elem[oi].integer.value,
+					     p->res_size,
 					     pwr_eff_chans, p->pwr_eff_resolve,
 					     N_PWR_EFF))
 				resolved++;
+
+			if (!strcmp(elem[ni].string.pointer, "SPBM_PROCHOT_STATUS_OFFSET") &&
+			    spbm_validate_bounds(elem[oi].integer.value, sizeof(u32), p->res_size) == 0) {
+				p->prochot_off = (u32)elem[oi].integer.value;
+				resolved++;
+			}
 		}
 	}
 
@@ -511,11 +534,18 @@ static int spbm_add(struct acpi_device *adev)
 	struct device *hwdev;
 	int spbm_idx, idx = 0, ret, resolved, i, j;
 
+	/* Stage 1: DMI Whitelist Verification */
+	if (!dmi_check_system(spbm_dmi_table)) {
+		dev_dbg(dev, "Platform not supported by DMI whitelist\n");
+		return -ENODEV;
+	}
+
 	p = devm_kzalloc(dev, sizeof(*p), GFP_KERNEL);
 	if (!p)
 		return -ENOMEM;
 
-	/* Initialize all offsets to "unknown" */
+	mutex_init(&p->lock);
+
 	memset(p->pwr_off, 0xFF, sizeof(p->pwr_off));
 	memset(p->pwr_cap_off, 0xFF, sizeof(p->pwr_cap_off));
 	memset(p->pwr_max_off, 0xFF, sizeof(p->pwr_max_off));
@@ -526,42 +556,53 @@ static int spbm_add(struct acpi_device *adev)
 	memset(p->pwr_eff_resolve, 0xFF, sizeof(p->pwr_eff_resolve));
 	memset(p->nrg_off, 0xFF, sizeof(p->nrg_off));
 	memset(p->temp_off, 0xFF, sizeof(p->temp_off));
-	memset(p->status_off, 0xFF, sizeof(p->status_off));
+	p->prochot_off = OFF_UNKNOWN;
 	memset(p->pl_os_off, 0xFF, sizeof(p->pl_os_off));
 
-	/* Ask _DSM which _CRS resource is "SPBM" */
 	spbm_idx = spbm_dsm_find_resource(adev->handle, "SPBM");
 	if (spbm_idx < 0) {
-		dev_err(dev, "_DSM did not advertise SPBM resource (%d)\n",
+		dev_dbg(dev, "_DSM did not advertise SPBM resource (%d)\n",
 			spbm_idx);
 		return spbm_idx;
 	}
 
-	/*
-	 * Resolve register offsets from _DSM function 2.
-	 * The sub-index for function 2 does not necessarily match the
-	 * resource index from function 1 (e.g. "SPBM" may be resource 0
-	 * but its register map lives under function 2 sub-index 1).
-	 * Try all sub-indices and accumulate resolved offsets.
-	 */
+	INIT_LIST_HEAD(&res_list);
+	ret = acpi_dev_get_resources(adev, &res_list, NULL, NULL);
+	if (ret < 0)
+		return ret;
+
+	list_for_each_entry(re, &res_list, node) {
+		if (resource_type(re->res) == IORESOURCE_MEM) {
+			if (idx == spbm_idx) {
+				phys = re->res->start;
+				p->res_size = resource_size(re->res);
+				break;
+			}
+			idx++;
+		}
+	}
+	acpi_dev_free_resource_list(&res_list);
+
+	if (!phys || p->res_size < sizeof(u32)) {
+		dev_err(dev, "SPBM memory resource invalid in _CRS\n");
+		return -ENODEV;
+	}
+
+	p->base = devm_ioremap(dev, phys, p->res_size);
+	if (!p->base)
+		return -ENOMEM;
+
 	resolved = 0;
-	for (i = 0; i < 16; i++) {
+	for (i = 0; i < SPBM_MAX_DSM_INDICES; i++) {
 		ret = spbm_dsm_resolve_offsets(dev, adev->handle, i, p);
 		if (ret == -ENODEV)
-			break;	/* _DSM call itself failed; no more indices */
+			break;
 		if (ret > 0)
 			resolved += ret;
 	}
-	dev_info(dev, "resolved %d/%zu register offsets from _DSM\n",
-		 resolved,
-		 N_PWR + N_NRG + N_TEMP + N_STATUS + N_PL_OS + N_PWR_HIGH +
-		 N_PWR_LOW + N_PWR_EFF);
 
-	/*
-	 * Map OS power limit offsets to power_cap on matching power channels.
-	 * pl_os_chans labels are "pl1_os", "pl2_os", etc; match by stripping
-	 * the "_os" suffix against power channel labels "pl1", "pl2", etc.
-	 */
+	dev_dbg(dev, "resolved %d register offsets from _DSM\n", resolved);
+
 	for (i = 0; i < N_PL_OS; i++) {
 		size_t plen;
 
@@ -578,34 +619,6 @@ static int spbm_add(struct acpi_device *adev)
 		}
 	}
 
-	/* Walk _CRS to find the memory resource at that index */
-	INIT_LIST_HEAD(&res_list);
-	ret = acpi_dev_get_resources(adev, &res_list, NULL, NULL);
-	if (ret < 0)
-		return ret;
-
-	list_for_each_entry(re, &res_list, node) {
-		if (resource_type(re->res) == IORESOURCE_MEM) {
-			if (idx == spbm_idx) {
-				phys = re->res->start;
-				break;
-			}
-			idx++;
-		}
-	}
-	acpi_dev_free_resource_list(&res_list);
-
-	if (!phys) {
-		dev_err(dev, "SPBM memory resource (index %d) not in _CRS\n",
-			spbm_idx);
-		return -ENODEV;
-	}
-
-	p->base = devm_ioremap(dev, phys, SPBM_SIZE);
-	if (!p->base)
-		return -ENOMEM;
-
-	/* Map firmware limit ceiling/floor to power_max/min on matching channels */
 	for (i = 0; i < N_PWR_HIGH; i++) {
 		if (p->pwr_high_off[i] == OFF_UNKNOWN)
 			continue;
@@ -629,7 +642,6 @@ static int spbm_add(struct acpi_device *adev)
 		}
 	}
 
-	/* Map effective limit offsets for power_cap readback */
 	for (i = 0; i < N_PWR_EFF; i++) {
 		if (p->pwr_eff_resolve[i] == OFF_UNKNOWN)
 			continue;
@@ -642,43 +654,22 @@ static int spbm_add(struct acpi_device *adev)
 		}
 	}
 
-	/* Sanity check: read first power channel if resolved */
-	if (p->pwr_off[0] != OFF_UNKNOWN) {
-		u32 test = ioread32(p->base + p->pwr_off[0]);
+	/* Initialize 64-bit energy accumulators with initial readings */
+	for (i = 0; i < N_NRG; i++) {
+		if (p->nrg_off[i] != OFF_UNKNOWN) {
+			u32 init_raw;
 
-		if (test == 0 || test == 0xFFFFFFFF)
-			dev_warn(dev, "%s=%u, telemetry may be inactive\n",
-				 pwr_chans[0].label, test);
-		else
-			dev_info(dev, "live at 0x%llx (res %d): %s=%u mW\n",
-				 (u64)phys, spbm_idx,
-				 pwr_chans[0].label, test);
+			init_raw = ioread32(p->base + p->nrg_off[i]);
+			spbm_energy_acc_init(&p->energy_acc[i], init_raw);
+		}
 	}
-
-	/* Build dynamic status sysfs attributes from status_chans[] */
-	for (i = 0; i < N_STATUS; i++) {
-		struct sensor_device_attribute *sa = &p->status_sattrs[i];
-
-		sa->dev_attr.attr.name = status_chans[i].label;
-		sa->dev_attr.attr.mode = 0444;
-		sa->dev_attr.show = spbm_status_show;
-		sa->index = i;
-		sysfs_attr_init(&sa->dev_attr.attr);
-		p->status_attrs[i] = &sa->dev_attr.attr;
-	}
-	p->status_attrs[N_STATUS] = NULL;
-	p->status_group.attrs = p->status_attrs;
-	p->status_group.is_visible = spbm_status_visible;
-	p->extra_groups[0] = &p->status_group;
-	p->extra_groups[1] = NULL;
 
 	hwdev = devm_hwmon_device_register_with_info(dev, DRIVER_NAME, p,
-						     &spbm_chip,
-						     p->extra_groups);
+						     &spbm_chip, NULL);
 	if (IS_ERR(hwdev))
 		return PTR_ERR(hwdev);
 
-	dev_info(dev, "registered %zu power + %zu energy + %zu temp channels\n",
+	dev_info(dev, "probed %zu power, %zu energy, %zu temp channels\n",
 		 N_PWR, N_NRG, N_TEMP);
 
 	return 0;
