@@ -113,6 +113,12 @@ make test
 
 ---
 
+## Integration with Aitra Meter
+
+`spbm-hwmon` is fully compatible with [Aitra Meter](https://github.com/aitra-ai/aitra-meter) host energy monitoring out-of-the-box (`--host-energy-provider=grace-spark-hwmon`). Its 64-bit monotonic accumulators resolve the 32-bit firmware rollover cliff, enabling continuous long-term Prometheus telemetry on NVIDIA GB10 / DGX Spark systems.
+
+---
+
 ## Roadmap
 
 - Migrate driver model from `acpi_driver` to `platform_driver` via `acpi_create_platform_device()`.
