@@ -10,7 +10,7 @@ Supported chips:
     Addresses: ACPI NVDA8800 (\_SB_.MTEL)
     Datasheet: Reverse-engineered from ACPI DSDT _DSM method
 
-Author: Antheas Kapenekakis <antheas@cs.aau.dk>
+Author: SPBM Driver Contributors
 
 Description
 -----------
