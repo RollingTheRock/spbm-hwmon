@@ -180,41 +180,44 @@ static void test_mailbox_serialization(void)
 
 /* --- Stage 3 Tests: Monotonic Energy Unwrapping --- */
 
+/* --- Stage 3 Tests: Monotonic Energy Unwrapping --- */
+
 static void test_energy_monotonic_unwrapping(void)
 {
 	struct spbm_energy_acc acc;
-	spbm_energy_acc_init(&acc, 0);
+	/* Start near 32-bit ceiling */
+	spbm_energy_acc_init(&acc, 0xFFFFFF00);
 
-	/* Sample 1: initial reading */
-	uint64_t val1 = spbm_energy_acc_update(&acc, 0x1000);
-	TEST_ASSERT(val1 == (uint64_t)0x1000 * 1000, "val1 should be 0x1000 * 1000 uJ");
+	/* Sample 1: small advance of 128 mJ before rollover */
+	uint64_t val1 = spbm_energy_acc_update(&acc, 0xFFFFFF80);
+	TEST_ASSERT(val1 == ((uint64_t)0xFFFFFF00 + 0x80) * 1000ULL,
+		    "val1 should advance by 0x80 mJ");
 
-	/* Sample 2: near 32-bit ceiling */
-	uint64_t val2 = spbm_energy_acc_update(&acc, 0xFFFFFF00);
-	TEST_ASSERT(val2 == (uint64_t)0xFFFFFF00 * 1000, "val2 should be 0xFFFFFF00 * 1000 uJ");
+	/* Sample 2: 32-bit roll-over across 0xFFFFFFFF to 0x00000100 (delta = 0x180 mJ) */
+	uint64_t val2 = spbm_energy_acc_update(&acc, 0x00000100);
+	uint64_t expected_mj = (uint64_t)0xFFFFFF00 + 0x80 + 0x180;
+	TEST_ASSERT(val2 > val1, "energy value must be strictly monotonic across 32-bit rollover");
+	TEST_ASSERT(val2 == expected_mj * 1000ULL,
+		    "val2 must correctly unwrap 32-bit rollover");
 
-	/* Sample 3: 32-bit roll-over to 0x00000100 */
-	uint64_t val3 = spbm_energy_acc_update(&acc, 0x00000100);
-	uint64_t expected_mj = (uint64_t)0xFFFFFF00 + 0x200;
-	TEST_ASSERT(val3 > val2, "energy value must be strictly monotonic across 32-bit rollover");
-	TEST_ASSERT(val3 == expected_mj * 1000, "val3 must equal (0xFFFFFF00 + 0x200) * 1000 uJ");
-
-	/* Sample 4: multiple wrap-arounds */
+	/* Sample 3: zero delta and normal multi-cycle rollover */
 	for (int i = 0; i < 5; i++) {
-		uint64_t prev = val3;
-		val3 = spbm_energy_acc_update(&acc, 0x00000100); /* delta = 0 */
-		TEST_ASSERT(val3 == prev, "zero delta should not change accumulator");
+		uint64_t prev = val2;
+		val2 = spbm_energy_acc_update(&acc, acc.last_raw_mj); /* delta = 0 */
+		TEST_ASSERT(val2 == prev, "zero delta should not change accumulator");
 
-		val3 = spbm_energy_acc_update(&acc, 0x80000000);
-		TEST_ASSERT(val3 > prev, "positive delta must increase accumulator");
-		prev = val3;
-
-		val3 = spbm_energy_acc_update(&acc, 0x00000100); /* wrap-around */
-		TEST_ASSERT(val3 > prev, "wrap-around must increase accumulator");
+		/* Set near ceiling and trigger rollover with 64 mJ delta */
+		acc.last_raw_mj = 0xFFFFFFE0;
+		prev = val2;
+		val2 = spbm_energy_acc_update(&acc, 0x00000020); /* rollover delta = 64 mJ */
+		TEST_ASSERT(val2 == prev + 64ULL * 1000ULL,
+			    "rollover must add exact delta to running total");
 	}
+
 
 	TEST_PASS();
 }
+
 
 /* --- Stage 4 Tests: Standard hwmon ABI Compliance --- */
 
@@ -257,19 +260,72 @@ static void test_spbm_try_resolve_bounds(void)
 	TEST_PASS();
 }
 
+/* --- Stage 5 Tests: Force Override & Firmware Reset Protection --- */
+
+static void test_dmi_force_override(void)
+{
+	struct spbm_dmi_info dmi = {
+		.sys_vendor = "ASUSTeK COMPUTER INC.",
+		.product_name = "To be filled by O.E.M.",
+		.product_family = "Engineering Sample",
+	};
+
+	/* Without force: must reject unsupported platform */
+	TEST_ASSERT(spbm_dmi_is_supported_or_forced(&dmi, false) == false,
+		    "unknown DMI without force must be rejected");
+
+	/* With force: must permit driver load */
+	TEST_ASSERT(spbm_dmi_is_supported_or_forced(&dmi, true) == true,
+		    "unknown DMI with force=true must be accepted");
+
+	TEST_PASS();
+}
+
+static void test_energy_firmware_reset_protection(void)
+{
+	struct spbm_energy_acc acc;
+	spbm_energy_acc_init(&acc, 0x80000000);
+
+	/* Sample 1: small advance of 1000 mJ (1W for 1s) */
+	uint64_t val1 = spbm_energy_acc_update(&acc, 0x800003E8);
+	uint64_t expected1 = ((uint64_t)0x80000000 + 1000) * 1000ULL;
+	TEST_ASSERT(val1 == expected1, "val1 should advance by 1000 mJ (1000000 uJ)");
+
+	/*
+	 * SSPM firmware crash/reset event:
+	 * Counter drops from 0x800003E8 to 0x00000010.
+	 * Unsigned 32-bit math would produce delta_mj = 0x7FFFFC28 (~2.147 billion mJ).
+	 */
+	uint64_t val2 = spbm_energy_acc_update(&acc, 0x00000010);
+
+	/* Protection requirement: accumulated value must NOT jump by 2 billion mJ */
+	TEST_ASSERT(val2 == val1, "val2 must not accumulate phantom delta during firmware reset");
+	TEST_ASSERT(acc.last_raw_mj == 0x00000010, "last_raw_mj must re-sync to new counter baseline");
+
+	/* Subsequent normal advance: from 0x00000010 to 0x00000060 (delta = 80 mJ) */
+	uint64_t val3 = spbm_energy_acc_update(&acc, 0x00000060);
+	TEST_ASSERT(val3 == val1 + 80ULL * 1000ULL,
+		    "val3 must resume normal monotonic accumulation from re-synced baseline");
+
+	TEST_PASS();
+}
+
 int main(void)
 {
 	printf("=== Running SPBM Unit Tests ===\n");
 	test_dmi_match_valid_xfusion();
 	test_dmi_match_valid_nvidia();
 	test_dmi_reject_foreign_hardware();
+	test_dmi_force_override();
 	test_bounds_valid_range();
 	test_bounds_out_of_range();
 	test_mailbox_serialization();
 	test_energy_monotonic_unwrapping();
+	test_energy_firmware_reset_protection();
 	test_hwmon_abi_compliance();
 	test_spbm_try_resolve_bounds();
 
 	printf("\nSummary: %d tests run, %d failed.\n", tests_run, tests_failed);
 	return tests_failed == 0 ? 0 : 1;
 }
+

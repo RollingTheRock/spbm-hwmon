@@ -47,6 +47,13 @@ static inline bool spbm_dmi_is_supported(const struct spbm_dmi_info *info)
 	return false;
 }
 
+static inline bool spbm_dmi_is_supported_or_forced(const struct spbm_dmi_info *info, bool force)
+{
+	if (force)
+		return true;
+	return spbm_dmi_is_supported(info);
+}
+
 /*
  * [RollingTheRock] ##RollingTheRock:
  * Memory boundary validation helper protecting MMIO ranges.
@@ -97,6 +104,8 @@ static inline bool spbm_try_resolve_bounds(const char *key, u64 offset,
  * [RollingTheRock] ##RollingTheRock:
  * 64-bit Monotonic Energy Accumulator resolving hardware 32-bit roll-over.
  */
+#define SPBM_ENERGY_MAX_DELTA_MJ	1800000000U /* 500W sustained for 1 hour */
+
 struct spbm_energy_acc {
 	u64 accumulated_uj;
 	u32 last_raw_mj;
@@ -119,6 +128,12 @@ static inline u64 spbm_energy_acc_update(struct spbm_energy_acc *acc, u32 raw_mj
 
 	/* Unsigned 32-bit subtraction correctly handles roll-over */
 	u32 delta_mj = raw_mj - acc->last_raw_mj;
+
+	/* Detect firmware crash/reset (e.g. SSPM reset) or abnormal discontinuity */
+	if (delta_mj > SPBM_ENERGY_MAX_DELTA_MJ) {
+		acc->last_raw_mj = raw_mj;
+		return acc->accumulated_uj;
+	}
 
 	acc->accumulated_uj += (u64)delta_mj * 1000ULL;
 	acc->last_raw_mj = raw_mj;

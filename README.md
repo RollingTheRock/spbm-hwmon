@@ -9,10 +9,11 @@ Interfaces with the System Power Budget Manager (SPBM) shared memory buffer upda
 ## Features
 
 - **Standard hwmon ABI**: Fully compatible with `sensors` and standard monitoring tools. Thermal throttling (PROCHOT) exposed as `temp1_crit_alarm`.
-- **Hardware Whitelist**: DMI quirk filtering (`dmi_check_system`) for target platforms (`NVIDIA DGX Spark`, `FusionXpark GB10`).
+- **Hardware Whitelist & Force Override**: DMI quirk filtering (`dmi_check_system`) for target platforms (`NVIDIA DGX Spark`, `FusionXpark GB10`), with `force=1` module parameter override for unlisted hardware.
 - **Dynamic DSM & Bounds Defense**: Discovers memory indices and canonical names via `_DSM`, validated against ACPI resource lengths.
-- **64-bit Monotonic Energy**: Unwraps 32-bit hardware millijoule counters into monotonic 64-bit microjoule accumulators.
+- **64-bit Monotonic Energy with Reset Protection**: Unwraps 32-bit hardware millijoule counters into monotonic 64-bit microjoule accumulators, with anomaly bounds protection against firmware restarts.
 - **Concurrency Protection**: Mutex-serialized mailbox updates and power limit writes.
+
 
 ---
 

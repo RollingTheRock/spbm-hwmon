@@ -78,8 +78,13 @@ static const struct dmi_system_id spbm_dmi_table[] = {
 };
 MODULE_DEVICE_TABLE(dmi, spbm_dmi_table);
 
+static bool force;
+module_param(force, bool, 0444);
+MODULE_PARM_DESC(force, "Force driver load even if DMI check fails");
+
 /*
  * _DSM UUID for NVDA8800 MTEL device.
+
  * Function 1 returns resource names, function 2 returns register maps.
  */
 static const guid_t mtel_dsm_guid =
@@ -552,10 +557,14 @@ static int spbm_add(struct acpi_device *adev)
 	int spbm_idx, idx = 0, ret, resolved, i, j;
 
 	/* Stage 1: DMI Whitelist Verification */
-	if (!dmi_check_system(spbm_dmi_table)) {
-		dev_dbg(dev, "Platform not supported by DMI whitelist\n");
+	if (!force && !dmi_check_system(spbm_dmi_table)) {
+		dev_warn(dev, "Platform not recognized by DMI whitelist (use force=1 to override)\n");
 		return -ENODEV;
 	}
+
+	if (force && !dmi_check_system(spbm_dmi_table))
+		dev_info(dev, "Forcing driver load on unrecognized DMI platform\n");
+
 
 	p = devm_kzalloc(dev, sizeof(*p), GFP_KERNEL);
 	if (!p)

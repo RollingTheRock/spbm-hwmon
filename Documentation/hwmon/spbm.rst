@@ -40,6 +40,14 @@ before performing MMIO mapping. Supported platforms include:
 - System Vendor: ``NVIDIA`` or ``XFUSION``
 - Product Name / Family: ``DGX Spark``, ``FusionXpark GB10``
 
+Module Parameters
+-----------------
+
+* ``force``: bool (default: false)
+  Force driver load even if the platform is not recognized by the DMI whitelist table.
+  Enables operation on engineering samples and third-party GB10 hardware.
+
+
 Sysfs Attributes
 ----------------
 
@@ -100,6 +108,11 @@ energy4_input     gpu              Cumulative GPU energy
 The underlying firmware counters are 32-bit millijoule registers. The driver
 handles 32-bit roll-over arithmetic internally, providing monotonically increasing
 64-bit microjoule counters suitable for continuous Prometheus and APM scraping.
+To guard against MediaTek SSPM firmware resets and erratic counter drops, single-step
+energy deltas are validated against a physical ceiling (1.8 GJ, representing 1 hour
+at 500W peak power). Counter discontinuities exceeding this bound trigger automatic
+baseline re-synchronization without phantom energy jumps.
+
 
 Temperature Sensors (millidegrees C)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
